@@ -1,0 +1,1950 @@
+<!DOCTYPE html>
+<html lang="es"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        window.addEventListener('click', (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: the comment bubble itself (a 24px white teardrop,
+  // tail tip bottom-left = the hotspot), drawn by the browser so it has no
+  // lag; the host paints only the inspector box and, on click, the pin.
+  // Same glyph as the host's pins (size-6 rounded-full rounded-bl-[2px]);
+  // cursor images take no CSS shadow, so a slightly stronger 1px ring
+  // stands in for ring + shadow. SVG first (rasterised at device scale
+  // where supported), the same glyph as a 24px PNG for engines without
+  // SVG cursors (WebKit), then the arrow.
+  var BUBBLE_SVG =
+    "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'>" +
+    "<path d='M12 .5h0A11.5 11.5 0 0 1 23.5 12v0A11.5 11.5 0 0 1 12 23.5H2.5a2 2 0 0 1-2-2V12A11.5 11.5 0 0 1 12 .5Z' fill='#fff' stroke='rgba(0,0,0,0.22)' stroke-width='1'/>" +
+    "</svg>";
+  var BUBBLE_PNG =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC";
+  var BUBBLE_CURSOR =
+    "url(\"data:image/svg+xml," + encodeURIComponent(BUBBLE_SVG) + "\") 1 23, " +
+    "url(\"" + BUBBLE_PNG + "\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: window.scrollY || 0,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "7a80cf26-20cd-4f1d-af6b-a7c669dfb6fb" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(scheduleRects, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Corbatul · Análisis Estratégico y Financiero</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&amp;family=Inter:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f6f3ee; --paper:#fffdf9; --ink:#1d2433; --muted:#5d6577; --line:#e3ddd2;
+  --navy:#1f3a5f; --navy2:#2d5487; --gold:#c08a2e; --wine:#8c2f39; --green:#2f7d5b; --amber:#d08a1c;
+  --soft-navy:#e7eef7; --soft-gold:#f7eedc; --soft-wine:#f6e3e5; --soft-green:#e2f1ea;
+  --shadow:0 10px 30px rgba(29,36,51,.08);
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--ink);font-family:Inter,system-ui,sans-serif;font-size:16px;line-height:1.5;overflow:hidden}
+h1,h2,h3{font-family:Fraunces,Georgia,serif;margin:0 0 .4em;line-height:1.15;color:var(--navy)}
+h2{font-size:clamp(1.5rem,3vw,2.2rem)}
+h3{font-size:1.15rem}
+p{margin:.3em 0 .7em}
+small{color:var(--muted)}
+
+/* Top bar */
+.topbar{position:fixed;top:0;left:0;right:0;height:56px;display:flex;align-items:center;gap:10px;padding:0 16px;background:var(--navy);color:#fff;z-index:20}
+.brand{font-family:Fraunces,serif;font-weight:700;letter-spacing:.3px;white-space:nowrap}
+.brand span{color:var(--gold)}
+.spacer{flex:1}
+.btn{border:1px solid rgba(255,255,255,.35);background:transparent;color:#fff;padding:7px 12px;border-radius:8px;font:500 .85rem Inter;cursor:pointer;white-space:nowrap}
+.btn:hover{background:rgba(255,255,255,.12)}
+.btn.on{background:var(--gold);border-color:var(--gold);color:#1d2433}
+.progress{position:fixed;top:56px;left:0;height:4px;background:var(--gold);z-index:21;transition:width .35s}
+
+/* Slides */
+.deck{position:fixed;top:60px;bottom:64px;left:0;right:0}
+.slide{position:absolute;inset:0;overflow-y:auto;padding:28px 16px 40px;opacity:0;visibility:hidden;transform:translateX(30px);transition:opacity .4s,transform .4s,visibility .4s}
+.slide.active{opacity:1;visibility:visible;transform:none}
+.slide.prev{transform:translateX(-30px)}
+.wrap{max-width:1100px;margin:0 auto}
+.kicker{font:600 .75rem Inter;letter-spacing:.14em;text-transform:uppercase;color:var(--gold);margin-bottom:6px}
+.lead{font-size:1.08rem;color:#333c4f}
+
+/* Bottom nav */
+.navbar{position:fixed;bottom:0;left:0;right:0;height:64px;display:flex;align-items:center;justify-content:center;gap:14px;background:var(--paper);border-top:1px solid var(--line);z-index:20}
+.navbtn{width:44px;height:44px;border-radius:50%;border:1px solid var(--line);background:#fff;font-size:1.2rem;cursor:pointer;color:var(--navy)}
+.navbtn:hover{background:var(--soft-navy)}
+.counter{font:600 .9rem Inter;color:var(--muted);min-width:70px;text-align:center}
+
+/* Index menu */
+.menu{position:fixed;top:60px;right:0;width:min(340px,100%);bottom:64px;background:var(--paper);border-left:1px solid var(--line);box-shadow:var(--shadow);z-index:25;transform:translateX(105%);transition:transform .3s;overflow-y:auto;padding:16px}
+.menu.open{transform:none}
+.menu h3{margin-bottom:10px}
+.menu ol{margin:0;padding-left:22px}
+.menu li{padding:6px 4px;cursor:pointer;border-radius:6px}
+.menu li:hover,.menu li.cur{background:var(--soft-navy);color:var(--navy);font-weight:600}
+
+/* Cards & grids */
+.grid{display:grid;gap:16px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.g4{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}
+.card{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:var(--shadow)}
+.card.navy{background:var(--navy);color:#fff;border-color:var(--navy)}
+.card.navy h3{color:#fff}
+.tag{display:inline-block;font:600 .72rem Inter;padding:3px 8px;border-radius:99px;background:var(--soft-gold);color:#7a5414;margin:0 4px 4px 0}
+.tag.r{background:var(--soft-wine);color:var(--wine)} .tag.g{background:var(--soft-green);color:var(--green)} .tag.b{background:var(--soft-navy);color:var(--navy)}
+.kpi{text-align:center;padding:14px}
+.kpi b{display:block;font:700 1.7rem Fraunces;color:var(--navy)}
+.kpi span{font-size:.82rem;color:var(--muted)}
+ul.clean{padding-left:18px;margin:.3em 0}
+ul.clean li{margin:.25em 0}
+.src{font-size:.75rem;color:var(--muted);margin-top:8px}
+.note{border-left:4px solid var(--gold);background:var(--soft-gold);padding:10px 14px;border-radius:8px;font-size:.9rem}
+.note.r{border-color:var(--wine);background:var(--soft-wine)}
+
+/* Cover */
+.cover{min-height:100%;display:flex;align-items:center}
+.cover-box{display:grid;grid-template-columns:1.2fr 1fr;gap:24px;align-items:center;width:100%}
+.cover h1{font-size:clamp(2rem,5vw,3.4rem)}
+.cover .sub{font-size:1.15rem;color:var(--muted)}
+.idcard{background:var(--paper);border:1px solid var(--line);border-radius:16px;padding:20px;box-shadow:var(--shadow)}
+.field{display:flex;flex-direction:column;border-bottom:1px dashed var(--line);padding:8px 0}
+.field label{font:600 .7rem Inter;letter-spacing:.1em;text-transform:uppercase;color:var(--gold)}
+.field div{font-weight:600;min-height:1.4em}
+.tie{width:100%;max-width:220px;margin:auto;display:block}
+
+/* Edit mode */
+body.editing [data-edit]{outline:1.5px dashed var(--gold);outline-offset:3px;border-radius:4px;cursor:text}
+body.editing [data-edit]:focus{outline:2px solid var(--navy);background:#fff}
+.edit-hint{display:none;position:fixed;bottom:72px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:8px 14px;border-radius:8px;font-size:.85rem;z-index:30}
+body.editing .edit-hint{display:block}
+
+/* Tabs */
+.tabs{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 14px}
+.tab{border:1px solid var(--line);background:#fff;padding:8px 14px;border-radius:99px;cursor:pointer;font:600 .88rem Inter;color:var(--navy)}
+.tab.on{background:var(--navy);color:#fff;border-color:var(--navy)}
+.panel{display:none;animation:fade .35s}
+.panel.on{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* Impact chips */
+.impact{display:flex;align-items:center;gap:8px;font-size:.85rem;margin-top:6px}
+.dot{width:10px;height:10px;border-radius:50%}
+
+/* Porter */
+.porter{display:grid;grid-template-columns:1fr 1.1fr 1fr;grid-template-rows:auto auto auto;gap:12px;align-items:stretch}
+.force{background:#fff;border:2px solid var(--line);border-radius:14px;padding:12px;cursor:pointer;transition:.2s;text-align:center}
+.force:hover,.force.on{border-color:var(--navy);transform:translateY(-2px);box-shadow:var(--shadow)}
+.force b{display:block;color:var(--navy);font-size:.92rem}
+.meter{height:8px;border-radius:9px;background:#eee;margin-top:8px;overflow:hidden}
+.meter i{display:block;height:100%;border-radius:9px}
+.center{grid-column:2;grid-row:2;background:var(--navy);color:#fff;border-color:var(--navy)}
+.center b{color:#fff}
+.f-top{grid-column:2;grid-row:1}.f-left{grid-column:1;grid-row:2}.f-right{grid-column:3;grid-row:2}.f-bot{grid-column:2;grid-row:3}
+.detail{margin-top:16px}
+
+/* Flip cards */
+.flip{perspective:1000px;min-height:210px;cursor:pointer}
+.flip-in{position:relative;width:100%;height:100%;min-height:210px;transition:transform .6s;transform-style:preserve-3d}
+.flip.on .flip-in{transform:rotateY(180deg)}
+.face{position:absolute;inset:0;backface-visibility:hidden;border-radius:14px;padding:16px;border:1px solid var(--line);background:var(--paper);box-shadow:var(--shadow);overflow:auto}
+.face.back{transform:rotateY(180deg);background:var(--navy);color:#fff}
+.face.back h3{color:var(--gold)}
+.face .hint{position:absolute;bottom:10px;right:14px;font-size:.72rem;color:var(--muted)}
+.face.back .hint{color:#c9d3e3}
+
+/* Tables / vertical */
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+th,td{padding:7px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+th{font:600 .75rem Inter;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+td input{width:90px;padding:5px 6px;border:1px solid var(--line);border-radius:6px;text-align:right;font:500 .9rem Inter}
+.bar{height:12px;border-radius:6px;background:var(--navy2);transition:width .4s}
+.bar.l{background:var(--wine)} .bar.e{background:var(--green)} .bar.c{background:var(--amber)}
+tr.tot td{font-weight:700;background:var(--soft-navy)}
+.select{padding:8px 12px;border-radius:8px;border:1px solid var(--line);font:600 .9rem Inter;background:#fff}
+.tablewrap{overflow-x:auto}
+
+/* Compare bars */
+.hbar{display:flex;align-items:center;gap:10px;margin:8px 0}
+.hbar .lbl{width:130px;font-size:.88rem;font-weight:600}
+.hbar .track{flex:1;background:#eee;border-radius:8px;height:22px;position:relative;overflow:hidden}
+.hbar .fill{height:100%;border-radius:8px;background:var(--navy2);display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#fff;font-size:.78rem;font-weight:700;transition:width .8s}
+.hbar .fill.neg{background:var(--wine)}
+
+/* Flow */
+.flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;align-items:stretch}
+.step{background:#fff;border:1px solid var(--line);border-radius:12px;padding:12px;position:relative}
+.step .n{display:inline-flex;width:28px;height:28px;border-radius:50%;background:var(--gold);color:#fff;font-weight:700;align-items:center;justify-content:center;margin-bottom:6px}
+
+details{background:#fff;border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin:8px 0}
+details summary{cursor:pointer;font-weight:600;color:var(--navy)}
+
+.refs p{padding-left:2em;text-indent:-2em;font-size:.88rem}
+
+@media (max-width:760px){
+  .cover-box{grid-template-columns:1fr}
+  .porter{grid-template-columns:1fr;grid-template-rows:none}
+  .porter .force{grid-column:auto!important;grid-row:auto!important}
+  .brand{font-size:.9rem}
+  .hide-sm{display:none}
+  .hbar .lbl{width:90px}
+}
+@media print{
+  body{overflow:visible}
+  .topbar,.navbar,.progress,.menu,.edit-hint{display:none!important}
+  .deck{position:static}
+  .slide{position:static;opacity:1;visibility:visible;transform:none;page-break-after:always;overflow:visible}
+  .flip-in{transform:none!important}.face.back{position:static;transform:none;margin-top:8px}
+}
+</style>
+<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
+<body id="artifacts-component-root-html" class="">
+
+<header class="topbar">
+  <div class="brand">Corbatul <span>·</span> Actividad 4</div>
+  <div class="spacer"></div>
+  <button class="btn on" id="btnEdit" title="Activa la edición de textos">✏️ <span class="hide-sm">Modo edición</span></button>
+  <button class="btn" id="btnSave" title="Descarga el HTML con tus cambios">💾 <span class="hide-sm">Descargar</span></button>
+  <button class="btn" id="btnMenu">☰ <span class="hide-sm">Índice</span></button>
+</header>
+<div class="progress" id="progress" style="width: 5.55556%;"></div>
+
+<aside class="menu" id="menu"><h3>Contenido</h3><ol id="menuList"><li class="cur">Portada</li><li>Introducción</li><li>Objetivos</li><li>Contexto de Corbatul</li><li>Macroentorno (PESTA)</li><li>Relación entre factores</li><li>Fuerzas competitivas (Porter)</li><li>Matriz de fuerzas</li><li>Empresas referentes</li><li>Competencias críticas por empresa</li><li>Competencias críticas para Corbatul</li><li>Indicadores financieros clave</li><li>Análisis vertical: Balance</li><li>Análisis vertical: Resultados</li><li>Inversión, financiación y costos</li><li>Conclusiones</li><li>Implicaciones para la gestión financiera</li><li>Referencias</li></ol>
+  <hr style="border:0;border-top:1px solid var(--line);margin:16px 0">
+  <button class="tab" id="btnReset" style="width:100%">↺ Restablecer textos originales</button>
+  <button class="tab" id="btnPrint" style="width:100%;margin-top:8px">🖨️ Imprimir / guardar PDF</button>
+</aside>
+
+<main class="deck" id="deck">
+
+<!-- 1 PORTADA -->
+<section class="slide active" data-title="Portada">
+  <div class="wrap cover">
+    <div class="cover-box">
+      <div>
+        <div class="kicker" data-edit="" contenteditable="false" data-key="t0">Gestión Financiera · Unidad 2 · Actividad 4</div>
+        <h1 data-edit="" contenteditable="false" data-key="t1">Análisis estratégico y financiero de la industria textil-confección: el caso Corbatul</h1>
+        <p class="sub" data-edit="" contenteditable="false" data-key="t2">Entorno, fuerzas competitivas, competencias críticas y estructura de inversión, financiamiento y costos.</p>
+        <div class="idcard">
+          <div class="field"><label>Estudiante</label><div data-edit="" data-key="nombre" contenteditable="false">ORLANDO JOSE OLEA GOMEZ</div></div>
+          <div class="field"><label>Identificación</label><div data-edit="" data-key="id" contenteditable="false"><span style="color: rgb(0, 0, 0); font-family: &quot;Open Sans&quot;, sans-serif; font-size: 14.44px; font-weight: 400; background-color: rgba(246, 246, 241, 0.22);">100221946</span></div></div>
+          <div class="field"><label>Programa</label><div data-edit="" data-key="programa" contenteditable="false"><span style="color: rgb(0, 0, 0); font-family: &quot;Open Sans&quot;, sans-serif; font-size: 14.44px; font-weight: 400; background-color: rgba(246, 246, 241, 0.22);">ESP GERENCIA DE PROYECTOS&nbsp;</span></div></div>
+          <div class="field"><label>Universidad</label><div data-edit="" data-key="universidad" contenteditable="false">Corporación Universitaria Iberoamericana</div></div>
+          <div class="field"><label>Asignatura / Docente</label><div data-edit="" data-key="docente" contenteditable="false">GERENCIA FINANCIERA · LESLIE CAROLINA VILLAMIL ESCOBAR</div></div>
+          <div class="field" style="border:0"><label>Fecha</label><div data-edit="" data-key="fecha" contenteditable="false">Octubre de 2026</div></div>
+        </div>
+        <p class="src">Pulsa <b>✏️ Modo edición</b> (arriba) para escribir tus datos. Navega con las flechas ← → o los botones de abajo.</p>
+      </div>
+      <svg class="tie" viewBox="0 0 200 320" aria-hidden="true">
+        <defs><pattern id="st" width="16" height="16" patternUnits="userSpaceOnUse" patternTransform="rotate(40)"><rect width="16" height="16" fill="#1f3a5f"></rect><rect width="6" height="16" fill="#2d5487"></rect></pattern></defs>
+        <path d="M70 20 L130 20 L118 62 L82 62 Z" fill="#c08a2e"></path>
+        <path d="M82 62 L118 62 L150 250 L100 305 L50 250 Z" fill="url(#st)"></path>
+        <path d="M82 62 L118 62 L150 250 L100 305 L50 250 Z" fill="none" stroke="#1d2433" stroke-width="2"></path>
+      </svg>
+    </div>
+  </div>
+</section>
+
+<!-- 2 INTRODUCCIÓN -->
+<section class="slide" data-title="Introducción">
+  <div class="wrap">
+    <div class="kicker">01 · Introducción</div>
+    <h2 data-edit="" contenteditable="false" data-key="t3">Una industria bajo presión que exige decisiones financieras con estrategia</h2>
+    <p class="lead" data-edit="" contenteditable="false" data-key="t4">Corbatul es una empresa colombiana que produce prendas de vestir para hombre y que ha tenido que adaptarse a la entrada de competidores externos, principalmente asiáticos (China). Antes de tomar decisiones en el simulador, este trabajo construye una lectura integral del contexto en el que compite la empresa, para que las decisiones de inversión y financiación se orienten a generar valor.</p>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="card">
+        <h3>¿Qué encontrará el lector?</h3>
+        <ul class="clean" data-edit="" contenteditable="false" data-key="t5">
+          <li><b>Macroentorno (PESTA):</b> factores políticos, económicos, sociales, ambientales y tecnológicos de Colombia en 2026 y cómo se relacionan.</li>
+          <li><b>Fuerzas competitivas (Porter, 1979):</b> intensidad de cada fuerza y su implicación para Corbatul.</li>
+          <li><b>Competencias críticas (Hamel y Prahalad, 1990):</b> recursos, capacidades y competencias de tres empresas líderes.</li>
+          <li><b>Análisis financiero vertical:</b> inversiones esenciales, fuentes de financiación y costos más representativos.</li>
+          <li><b>Conclusiones e implicaciones</b> para la gestión financiera bajo el objetivo básico financiero.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Método</h3>
+        <div class="flow" style="grid-template-columns:1fr">
+          <div class="step"><span class="n">1</span> <span data-edit="" contenteditable="false" data-key="t6">Revisión conceptual (Núñez, 2016; Pacheco, 2016; Castellanos et al., 2009).</span></div>
+          <div class="step"><span class="n">2</span> <span data-edit="" contenteditable="false" data-key="t7">Consulta de fuentes secundarias: Banco de la República, DANE, MinCIT, prensa económica (La República, Valora Analitik, Portafolio).</span></div>
+          <div class="step"><span class="n">3</span> <span data-edit="" contenteditable="false" data-key="t8">Selección de empresas referentes con información financiera pública (emisores en Bolsa y reportes a Supersociedades).</span></div>
+          <div class="step"><span class="n">4</span> <span data-edit="" contenteditable="false" data-key="t9">Análisis vertical y síntesis de implicaciones para Corbatul.</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 3 OBJETIVOS -->
+<section class="slide" data-title="Objetivos">
+  <div class="wrap">
+    <div class="kicker">02 · Objetivos</div>
+    <h2>Objetivo general</h2>
+    <div class="card navy"><p style="font-size:1.1rem;margin:0" data-edit="" contenteditable="false" data-key="t10">Analizar el entorno estratégico y la estructura financiera de la industria textil-confección colombiana, mediante herramientas de análisis del macroentorno, de la industria, de competencias críticas y de estados financieros, para orientar las decisiones de inversión y financiación de Corbatul hacia la generación de valor económico.</p></div>
+    <h2 style="margin-top:22px">Objetivos específicos</h2>
+    <div class="grid g2">
+      <div class="card"><span class="tag b">OE1</span><p data-edit="" contenteditable="false" data-key="t11"><b>Identificar</b> los factores políticos, económicos, sociales, ambientales y tecnológicos que inciden en el desempeño de la industria, <b>mediante</b> el análisis PESTA con fuentes secundarias actualizadas.</p></div>
+      <div class="card"><span class="tag b">OE2</span><p data-edit="" contenteditable="false" data-key="t12"><b>Evaluar</b> la intensidad de las cinco fuerzas competitivas del sector, <b>a través del</b> modelo de Porter, para establecer la posición competitiva de Corbatul.</p></div>
+      <div class="card"><span class="tag b">OE3</span><p data-edit="" contenteditable="false" data-key="t13"><b>Determinar</b> las competencias críticas para el éxito en la industria, <b>a partir del</b> estudio de recursos y capacidades de tres empresas líderes, según Hamel y Prahalad.</p></div>
+      <div class="card"><span class="tag b">OE4</span><p data-edit="" contenteditable="false" data-key="t14"><b>Examinar</b> la estructura de inversión, financiamiento y costos de la industria, <b>por medio del</b> análisis vertical del Estado de Situación Financiera y del Estado de Resultados de las empresas referentes.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 4 CONTEXTO CORBATUL -->
+<section class="slide" data-title="Contexto de Corbatul">
+  <div class="wrap">
+    <div class="kicker">03 · La empresa</div>
+    <h2>Corbatul en la cadena textil-confección</h2>
+    <div class="grid g3">
+      <div class="card"><h3>Qué hace</h3><p data-edit="" contenteditable="false" data-key="t15">Produce artículos de vestir para hombre (corbatas, camisas y complementos), un segmento donde el diseño, la calidad del acabado y la marca permiten diferenciarse del producto masivo importado.</p></div>
+      <div class="card"><h3>Su reto</h3><p data-edit="" contenteditable="false" data-key="t16">Competir contra importaciones asiáticas a muy bajo precio y contra el contrabando, en un mercado interno con consumo débil y costos laborales y financieros al alza.</p></div>
+      <div class="card"><h3>Dónde se ubica</h3><p data-edit="" contenteditable="false" data-key="t17">Eslabón de <b>confección</b>: compra telas e insumos (muchos importados), transforma y vende a través de canales mayoristas, grandes superficies o tiendas propias.</p></div>
+    </div>
+    <h3 style="margin-top:20px">La cadena de valor del sector</h3>
+    <div class="flow">
+      <div class="step"><span class="n">1</span><b>Fibras</b><br><small>Algodón, poliéster, PET reciclado (p. ej., Enka)</small></div>
+      <div class="step"><span class="n">2</span><b>Hilatura y tejeduría</b><br><small>Telas planas y denim (p. ej., Fabricato)</small></div>
+      <div class="step"><span class="n">3</span><b>Confección</b><br><small>Corte, costura, acabado (Corbatul)</small></div>
+      <div class="step"><span class="n">4</span><b>Comercialización</b><br><small>Retail propio, grandes cadenas, e-commerce (p. ej., Arturo Calle)</small></div>
+    </div>
+    <p class="src">El sector textil-confección emplea a unas 1,7 millones de personas en Colombia (Inexmoda vía abceconomia, 2026).</p>
+  </div>
+</section>
+
+<!-- 5 PESTA -->
+<section class="slide" data-title="Macroentorno (PESTA)">
+  <div class="wrap">
+    <div class="kicker">04 · Análisis del macroentorno</div>
+    <h2>Factores del entorno colombiano en 2026</h2>
+    <div class="grid g4" style="margin-bottom:10px">
+      <div class="card kpi"><b>6,29%</b><span>Inflación anual sep-2026 (DANE)</span></div>
+      <div class="card kpi"><b>12,25%</b><span>Tasa de política BanRep (sep-2026)</span></div>
+      <div class="card kpi"><b>+23%</b><span>Salario mínimo 2026: $1.750.905</span></div>
+      <div class="card kpi"><b>2,5%</b><span>Crecimiento PIB 2026 esperado</span></div>
+    </div>
+    <div class="tabs" data-tabs="pesta">
+      <button class="tab on" data-t="p">🏛️ Político</button>
+      <button class="tab" data-t="e">📈 Económico</button>
+      <button class="tab" data-t="s">👥 Social</button>
+      <button class="tab" data-t="a">🌱 Ambiental</button>
+      <button class="tab" data-t="t">💡 Tecnológico</button>
+    </div>
+    <div data-panels="pesta">
+      <div class="panel on" data-p="p"><div class="grid g2">
+        <div class="card"><h3>Hallazgos</h3><ul class="clean" data-edit="" contenteditable="false" data-key="t18">
+          <li><b>Cambio de gobierno:</b> Abelardo de la Espriella asumió la Presidencia el 7 de agosto de 2026 (periodo 2026-2030), tras vencer en segunda vuelta a Iván Cepeda; el giro de orientación abre incertidumbre sobre la política comercial, tributaria y laboral.</li>
+          <li><b>Protección arancelaria:</b> Colombia mantiene aranceles altos a confecciones de países sin acuerdo comercial (el Decreto 2598 de 2022 fijó 40% para ciertas importaciones) y en 2025 el Gobierno redujo a 0% el arancel de insumos y materias primas de la confección (Decretos 1197 y 1198 de 2025).</li>
+          <li><b>Contrabando:</b> gremios como Fenalco estiman que entra mercancía ilegal por cerca de $35 billones al año, y advierten que aranceles muy altos lo incentivan.</li>
+        </ul></div>
+        <div class="card"><h3>Impacto en Corbatul</h3><p data-edit="" contenteditable="false" data-key="t19">Mixto. El arancel a la prenda importada protege el precio local, y el arancel cero a insumos baja el costo de la tela importada. Pero el contrabando anula parte de esa protección y la transición política hace volátiles las reglas de juego.</p>
+          <div class="impact"><span class="dot" style="background:var(--amber)"></span> Impacto: medio · Tendencia: incierta</div></div>
+      </div></div>
+      <div class="panel" data-p="e"><div class="grid g2">
+        <div class="card"><h3>Hallazgos</h3><ul class="clean" data-edit="" contenteditable="false" data-key="t20">
+          <li><b>Inflación persistente:</b> 6,29% anual en septiembre de 2026, lejos de la meta de 3%; el mercado espera cerrar el año cerca de 6,8%.</li>
+          <li><b>Dinero caro:</b> el Banco de la República subió la tasa en 25 pb a 12,25% en septiembre de 2026, con expectativa de mantenerla sobre 12%.</li>
+          <li><b>Crecimiento moderado:</b> el PIB creció 3,52% en el II trimestre, pero la proyección para 2026 es de 2,5% y hay señales de debilidad en industria y comercio.</li>
+          <li><b>Tasa de cambio:</b> analistas esperaban un dólar cercano a $3.300 en diciembre de 2026; un peso fuerte abarata importaciones y presiona a la producción nacional.</li>
+        </ul></div>
+        <div class="card"><h3>Impacto en Corbatul</h3><p data-edit="" contenteditable="false" data-key="t21">Negativo. La deuda cuesta más, lo que eleva el costo de capital (WACC); la inflación encarece insumos y nómina; el consumo de vestuario es sensible al ingreso del hogar, por lo que la demanda se debilita justo cuando suben los costos.</p>
+          <div class="impact"><span class="dot" style="background:var(--wine)"></span> Impacto: alto · Tendencia: desfavorable</div></div>
+      </div></div>
+      <div class="panel" data-p="s"><div class="grid g2">
+        <div class="card"><h3>Hallazgos</h3><ul class="clean" data-edit="" contenteditable="false" data-key="t22">
+          <li><b>Costo laboral:</b> el salario mínimo 2026 subió 23% a $1.750.905. La reforma laboral (Ley 2466 de 2025) redujo la jornada a 42 horas desde el 15 de julio de 2026 y elevó el recargo dominical/festivo al 90% desde el 1 de julio.</li>
+          <li><b>Empleo:</b> el sector genera cerca de 1,7 millones de empleos y es intensivo en mano de obra, especialmente femenina, en la confección.</li>
+          <li><b>Consumidor:</b> busca precio, pero valora el diseño nacional; crece la compra en línea y la moda rápida (fast fashion) de plataformas internacionales.</li>
+        </ul></div>
+        <div class="card"><h3>Impacto en Corbatul</h3><p data-edit="" contenteditable="false" data-key="t23">Negativo en costos, oportunidad en marca. La mano de obra es el mayor costo de transformación de la confección; con un mínimo 23% más alto, la productividad por hora se vuelve crítica. A la vez, el consumidor que valora lo hecho en Colombia permite defender precio con propuesta de valor.</p>
+          <div class="impact"><span class="dot" style="background:var(--wine)"></span> Impacto: alto · Tendencia: desfavorable</div></div>
+      </div></div>
+      <div class="panel" data-p="a"><div class="grid g2">
+        <div class="card"><h3>Hallazgos</h3><ul class="clean" data-edit="" contenteditable="false" data-key="t24">
+          <li><b>Economía circular:</b> Enka obtuvo el 65% de sus ingresos de 2025 en "negocios verdes" (reciclaje de PET), mostrando que la sostenibilidad ya es una línea de negocio.</li>
+          <li><b>Exigencias de marcas y mercados:</b> compradores internacionales piden trazabilidad, menos agua y químicos, y material reciclado.</li>
+          <li><b>Eficiencia energética:</b> empresas como Crystal invierten en paneles solares para sustituir parte de su energía convencional.</li>
+        </ul></div>
+        <div class="card"><h3>Impacto en Corbatul</h3><p data-edit="" contenteditable="false" data-key="t25">Oportunidad. Usar telas recicladas o certificadas y reducir desperdicios puede diferenciar el producto frente al importado barato y abrir mercados de exportación, aunque exige inversión inicial (CAPEX) en procesos y certificaciones.</p>
+          <div class="impact"><span class="dot" style="background:var(--green)"></span> Impacto: medio · Tendencia: favorable</div></div>
+      </div></div>
+      <div class="panel" data-p="t"><div class="grid g2">
+        <div class="card"><h3>Hallazgos</h3><ul class="clean" data-edit="" contenteditable="false" data-key="t26">
+          <li><b>Abastecimiento inteligente:</b> Colombiatex 2026 giró en torno al "smart sourcing"; China pierde protagonismo como único centro de producción y se abre una oportunidad de relocalización (nearshoring) para Colombia.</li>
+          <li><b>Dependencia de insumos:</b> según Inexmoda, el 40% de las empresas importa más de la mitad de sus insumos.</li>
+          <li><b>Digitalización:</b> diseño asistido, corte automatizado, analítica de inventarios y comercio electrónico.</li>
+        </ul></div>
+        <div class="card"><h3>Impacto en Corbatul</h3><p data-edit="" contenteditable="false" data-key="t27">Oportunidad condicionada. La tecnología reduce costos por unidad y tiempos de respuesta (clave para competir con Asia en rapidez, no en precio). Requiere inversión y talento, lo que compite con otras necesidades de caja en un entorno de tasas altas.</p>
+          <div class="impact"><span class="dot" style="background:var(--green)"></span> Impacto: medio · Tendencia: favorable</div></div>
+      </div></div>
+    </div>
+  </div>
+</section>
+
+<!-- 6 SÍNTESIS PESTA -->
+<section class="slide" data-title="Relación entre factores">
+  <div class="wrap">
+    <div class="kicker">04 · Síntesis del macroentorno</div>
+    <h2>Cómo se conectan los factores</h2>
+    <p class="lead" data-edit="" contenteditable="false" data-key="t28">Los factores no actúan por separado: se encadenan y terminan presionando el margen y la caja de la empresa.</p>
+    <div class="flow">
+      <div class="step"><span class="n">1</span><b data-edit="" contenteditable="false" data-key="t29">Inflación alta</b><p data-edit="" contenteditable="false" data-key="t30">Lleva al BanRep a subir tasas (12,25%).</p></div>
+      <div class="step"><span class="n">2</span><b data-edit="" contenteditable="false" data-key="t31">Tasas altas</b><p data-edit="" contenteditable="false" data-key="t32">Encarecen la deuda y frenan el consumo a crédito.</p></div>
+      <div class="step"><span class="n">3</span><b data-edit="" contenteditable="false" data-key="t33">Salario mínimo +23% y jornada de 42 h</b><p data-edit="" contenteditable="false" data-key="t34">Suben el costo de producir cada prenda.</p></div>
+      <div class="step"><span class="n">4</span><b data-edit="" contenteditable="false" data-key="t35">Importación barata y contrabando</b><p data-edit="" contenteditable="false" data-key="t36">Impiden trasladar ese mayor costo al precio.</p></div>
+      <div class="step" style="background:var(--soft-wine)"><span class="n" style="background:var(--wine)">⇒</span><b data-edit="" contenteditable="false" data-key="t37">Compresión de márgenes</b><p data-edit="" contenteditable="false" data-key="t38">Menor rentabilidad operativa y más necesidad de capital de trabajo.</p></div>
+    </div>
+    <div class="grid g2" style="margin-top:18px">
+      <div class="card"><h3>Amenazas dominantes</h3><ul class="clean" data-edit="" contenteditable="false" data-key="t39"><li>Costo financiero y laboral creciente.</li><li>Demanda interna débil.</li><li>Competencia asiática y contrabando.</li><li>Incertidumbre por el cambio de gobierno.</li></ul></div>
+      <div class="card"><h3>Oportunidades</h3><ul class="clean" data-edit="" contenteditable="false" data-key="t40"><li>Nearshoring y relocalización de proveedores para EE. UU.</li><li>Arancel cero a insumos de confección.</li><li>Sostenibilidad como diferenciador.</li><li>Digitalización para responder más rápido que Asia.</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<!-- 7 PORTER -->
+<section class="slide" data-title="Fuerzas competitivas (Porter)">
+  <div class="wrap">
+    <div class="kicker">05 · Fuerzas competitivas de Porter</div>
+    <h2>¿Qué tan atractiva es la industria para Corbatul?</h2>
+    <p class="lead">Toca cada fuerza para ver su análisis. La barra muestra el nivel de poder (1 = bajo, 5 = alto).</p>
+    <div class="porter" id="porter">
+      <div class="force f-top" data-f="0"><b>Amenaza de nuevos entrantes</b><div class="meter"><i style="width: 80%; background: rgb(194, 91, 46);"></i></div><small class="lv">Poder: Alto (4/5)</small></div>
+      <div class="force f-left" data-f="1"><b>Poder de los proveedores</b><div class="meter"><i style="width: 60%; background: rgb(208, 138, 28);"></i></div><small class="lv">Poder: Medio (3/5)</small></div>
+      <div class="force center on" data-f="2"><b>Rivalidad entre competidores actuales</b><div class="meter"><i style="width: 100%; background: rgb(140, 47, 57);"></i></div><small class="lv">Poder: Muy alto (5/5)</small></div>
+      <div class="force f-right" data-f="3"><b>Poder de los clientes</b><div class="meter"><i style="width: 80%; background: rgb(194, 91, 46);"></i></div><small class="lv">Poder: Alto (4/5)</small></div>
+      <div class="force f-bot" data-f="4"><b>Amenaza de sustitutos</b><div class="meter"><i style="width: 60%; background: rgb(208, 138, 28);"></i></div><small class="lv">Poder: Medio (3/5)</small></div>
+    </div>
+    <div class="card detail" id="forceDetail"><span class="tag" style="background:#8c2f39;color:#fff">Poder Muy alto</span><h3>Rivalidad entre competidores actuales</h3><p data-edit="" data-key="force_d2" contenteditable="false">Muy alta. Hay más de 60.000 empresas en la cadena, con gran informalidad, producto poco diferenciado en el segmento básico y una demanda interna débil por tasas e inflación altas. Compiten marcas nacionales fuertes (Arturo Calle, Crystal/Gef, Studio F), cadenas internacionales (Zara, H&amp;M, Koaj) e importación asiática a precios muy bajos. Las líderes de aguas arriba reportan caídas: Fabricato −21% en ingresos 2024 y Enka −14% en 2025.</p><div class="note"><b>Implicación para Corbatul:</b> <span data-edit="" data-key="force_i2" contenteditable="false">Guerra de precios = destrucción de margen. Corbatul debe diferenciarse por nicho (moda masculina formal y complementos de calidad) y controlar costos fijos.</span></div></div>
+  </div>
+</section>
+
+<!-- 8 PORTER TABLA -->
+<section class="slide" data-title="Matriz de fuerzas">
+  <div class="wrap">
+    <div class="kicker">05 · Esquema de análisis (Figura 1)</div>
+    <h2>Matriz de fuerzas competitivas</h2>
+    <div class="tablewrap card" style="padding:6px 10px">
+    <table>
+      <thead><tr><th>Fuerza competitiva</th><th>Descripción / análisis</th><th>Poder</th><th>Implicación para Corbatul</th></tr></thead>
+      <tbody id="porterTable"><tr><td><b>Poder de negociación de los proveedores</b></td><td data-edit="" data-key="pt_d1" contenteditable="false">Poder medio. La tela y los insumos tienen proveedores nacionales (Fabricato, Enka, Coltejer) e internacionales, lo que da alternativas. Sin embargo, gran parte de los insumos es importada (el 40% de las empresas importa más de la mitad), con exposición al dólar, y los textiles técnicos o certificados tienen pocos oferentes. El arancel cero a insumos de confección (2025) reduce el poder de los proveedores locales.</td><td><span class="tag" style="background:#d08a1c;color:#fff">Medio</span><div class="meter"><i style="width:60%;background:#d08a1c"></i></div></td><td data-edit="" data-key="pt_i1" contenteditable="false">Diversificar proveedores, negociar plazos de pago (financiación sin costo) y gestionar el riesgo cambiario de las compras importadas.</td></tr><tr><td><b>Amenaza de nuevos entrantes</b></td><td data-edit="" data-key="pt_d0" contenteditable="false">Las barreras de entrada a la confección son bajas: se necesita poca inversión para montar un taller, la tecnología es accesible y no hay economías de escala decisivas. La verdadera amenaza son los entrantes externos: importadores de prendas asiáticas, plataformas de moda rápida en línea y contrabando, que llegan sin invertir en planta local. Los aranceles a confecciones de países sin acuerdo comercial elevan la barrera, pero el contrabando la debilita.</td><td><span class="tag" style="background:#c25b2e;color:#fff">Alto</span><div class="meter"><i style="width:80%;background:#c25b2e"></i></div></td><td data-edit="" data-key="pt_i0" contenteditable="false">Corbatul no puede apoyarse en barreras estructurales; debe construir barreras propias: marca, relación con clientes institucionales y rapidez de reposición.</td></tr><tr><td><b>Rivalidad entre competidores actuales</b></td><td data-edit="" data-key="pt_d2" contenteditable="false">Muy alta. Hay más de 60.000 empresas en la cadena, con gran informalidad, producto poco diferenciado en el segmento básico y una demanda interna débil por tasas e inflación altas. Compiten marcas nacionales fuertes (Arturo Calle, Crystal/Gef, Studio F), cadenas internacionales (Zara, H&amp;M, Koaj) e importación asiática a precios muy bajos. Las líderes de aguas arriba reportan caídas: Fabricato −21% en ingresos 2024 y Enka −14% en 2025.</td><td><span class="tag" style="background:#8c2f39;color:#fff">Muy alto</span><div class="meter"><i style="width:100%;background:#8c2f39"></i></div></td><td data-edit="" data-key="pt_i2" contenteditable="false">Guerra de precios = destrucción de margen. Corbatul debe diferenciarse por nicho (moda masculina formal y complementos de calidad) y controlar costos fijos.</td></tr><tr><td><b>Amenaza de productos sustitutos</b></td><td data-edit="" data-key="pt_d4" contenteditable="false">Media. El vestuario no tiene sustituto funcional, pero sí sustitutos de compra: ropa de segunda mano, alquiler de prendas, moda rápida en línea y cambio de hábitos (menos uso de corbata y ropa formal por el trabajo remoto y el estilo casual). Para la línea de corbatas, la tendencia hacia la informalidad es una amenaza real.</td><td><span class="tag" style="background:#d08a1c;color:#fff">Medio</span><div class="meter"><i style="width:60%;background:#d08a1c"></i></div></td><td data-edit="" data-key="pt_i4" contenteditable="false">Ampliar el portafolio hacia prendas business-casual y accesorios, y medir la rentabilidad por línea de producto para retirar las que pierden demanda.</td></tr><tr><td><b>Poder de negociación de los clientes</b></td><td data-edit="" data-key="pt_d3" contenteditable="false">Alto. Las grandes superficies concentran la distribución (el Grupo Éxito comercializa cerca de $1,4 billones de los $7 billones que produce la confección), imponen precios, plazos de pago largos y devoluciones. El consumidor final es sensible al precio y tiene alternativas abundantes, con costo de cambio prácticamente nulo.</td><td><span class="tag" style="background:#c25b2e;color:#fff">Alto</span><div class="meter"><i style="width:80%;background:#c25b2e"></i></div></td><td data-edit="" data-key="pt_i3" contenteditable="false">Reducir la dependencia de pocos clientes grandes, desarrollar canal propio o digital y vigilar la rotación de cartera (capital de trabajo).</td></tr></tbody>
+    </table></div>
+    <div class="note" style="margin-top:14px" data-edit="" contenteditable="false" data-key="t41"><b>Lectura global:</b> la industria es poco atractiva en rentabilidad promedio (rivalidad y poder de clientes altos, entrada fácil desde el exterior). Corbatul no puede ganar por precio contra Asia: su posición sostenible es un nicho de producto de valor agregado (diseño, calidad, rapidez de reposición y marca), con estructura de costos flexible.</div>
+    <p class="src">Elaboración propia, basada en Porter (1979).</p>
+  </div>
+</section>
+
+<!-- 9 EMPRESAS REFERENTES -->
+<section class="slide" data-title="Empresas referentes">
+  <div class="wrap">
+    <div class="kicker">06 · Selección de empresas líderes</div>
+    <h2>Tres referentes con información financiera pública</h2>
+    <p class="lead" data-edit="" contenteditable="false" data-key="t42">Se eligieron empresas cuya información financiera es de fácil acceso: dos emisoras en la Bolsa de Valores de Colombia (publican estados trimestrales en el SIMEV de la Superintendencia Financiera) y una que reporta a la Superintendencia de Sociedades y es la referencia natural de la moda masculina.</p>
+    <div class="grid g3">
+      <div class="card"><span class="tag">Confección + retail</span><h3>Arturo Calle</h3><p data-edit="" contenteditable="false" data-key="t43">Líder en moda masculina en Colombia, con presencia en Centroamérica y Perú. Ingresos 2024: $638.380 millones; utilidad: $22.782 millones; en 2025 creció más de 12%.</p><p class="src">Fuente de EEFF: Supersociedades (portal SIIS / SIRFIN).</p></div>
+      <div class="card"><span class="tag b">Textil + inmobiliario</span><h3>Fabricato S.A.</h3><p data-edit="" contenteditable="false" data-key="t44">Textilera centenaria de Antioquia, proveedora de telas planas y denim. Ingresos consolidados 2024: $268.616 millones (−21%); resultado neto: −$43.000 millones. Diversificó hacia el negocio inmobiliario.</p><p class="src">Fuente de EEFF: SIMEV – Superfinanciera; fabricato.com (inversionistas).</p></div>
+      <div class="card"><span class="tag g">Fibras + reciclaje</span><h3>Enka de Colombia S.A.</h3><p data-edit="" contenteditable="false" data-key="t45">Productora de fibras sintéticas y líder en reciclaje de PET. Ingresos individuales 2025: $406.475 millones (−14% frente a 2024); utilidades cayeron más de 69%; deuda neta bajó a $38.839 millones.</p><p class="src">Fuente de EEFF: SIMEV – Superfinanciera; enka.com.co.</p></div>
+    </div>
+    <h3 style="margin-top:20px">Ingresos operacionales comparados (millones de COP)</h3>
+    <div class="card" id="revBars"><div class="hbar"><span class="lbl">Arturo Calle (2024)</span><div class="track"><div class="fill" data-w="100" style="width:0">$638.380</div></div></div><div class="hbar"><span class="lbl">Enka (2025)</span><div class="track"><div class="fill" data-w="63.672890754722886" style="width:0">$406.475</div></div></div><div class="hbar"><span class="lbl">Fabricato (2024)</span><div class="track"><div class="fill" data-w="42.077759328299756" style="width:0">$268.616</div></div></div></div>
+    <p class="src">Crystal S.A.S. (Gef, Punto Blanco, Baby Fresh), tercer grupo textil del país con ingresos superiores a $800.000 millones y cerca de 7.000 empleados, sirve como cuarto referente opcional.</p>
+  </div>
+</section>
+
+<!-- 10 COMPETENCIAS -->
+<section class="slide" data-title="Competencias críticas por empresa">
+  <div class="wrap">
+    <div class="kicker">07 · Competencias críticas (Hamel y Prahalad, 1990)</div>
+    <h2>Recursos, capacidades y competencias de los líderes</h2>
+    <div class="tabs" data-tabs="comp">
+      <button class="tab on" data-t="ac">Arturo Calle</button>
+      <button class="tab" data-t="fa">Fabricato</button>
+      <button class="tab" data-t="en">Enka</button>
+    </div>
+    <div data-panels="comp">
+      <div class="panel on" data-p="ac"><div class="grid g3">
+        <div class="card"><span class="tag">Recursos</span><p data-edit="" contenteditable="false" data-key="t46">Marca con alta reputación (segunda en Colombia en 2024 según Merco); red de más de 100 tiendas; plantas propias de confección (Pereira) y cuero (Bogotá); solidez patrimonial con utilidades acumuladas.</p></div>
+        <div class="card"><span class="tag b">Capacidades</span><p data-edit="" contenteditable="false" data-key="t47">Integración vertical diseño–producción–venta; gestión de inventarios en tienda propia; manejo multimarca (AC, Colore, Signatura, AC Leather).</p></div>
+        <div class="card"><span class="tag g">Competencias distintivas</span><p data-edit="" contenteditable="false" data-key="t48">Relación calidad/precio constante en moda masculina formal; confianza del consumidor en la marca.</p></div>
+        <div class="card"><span class="tag r">Competencia nuclear</span><p data-edit="" contenteditable="false" data-key="t49">Control del canal de venta directo al consumidor, que le permite capturar el margen minorista y leer la demanda en tiempo real.</p></div>
+        <div class="card" style="grid-column:span 2"><span class="tag">Capacidad estratégica</span><p data-edit="" contenteditable="false" data-key="t50">Expansión internacional ordenada (Panamá, Costa Rica, El Salvador, Guatemala, Perú) y modelo de franquicias y tiendas pequeñas; supo usar utilidades retenidas para sostener la nómina en crisis.</p></div>
+      </div></div>
+      <div class="panel" data-p="fa"><div class="grid g3">
+        <div class="card"><span class="tag">Recursos</span><p data-edit="" contenteditable="false" data-key="t51">Planta industrial integrada (hilatura, tejeduría, tintorería y acabado); terrenos y propiedades (Parque Industrial en Rionegro, Ciudad Fabricato); marca reconocida en telas.</p></div>
+        <div class="card"><span class="tag b">Capacidades</span><p data-edit="" contenteditable="false" data-key="t52">Producción de telas técnicas de difícil imitación; autoabastecimiento de hilo; reciclaje de retazos de los talleres de confección.</p></div>
+        <div class="card"><span class="tag g">Competencias distintivas</span><p data-edit="" contenteditable="false" data-key="t53">Know-how textil centenario y desarrollo de telas especializadas, segmento donde el contrabando compite menos.</p></div>
+        <div class="card"><span class="tag r">Competencia nuclear</span><p data-edit="" contenteditable="false" data-key="t54">Ingeniería textil para productos de valor agregado (uso médico, técnico, uniformes).</p></div>
+        <div class="card" style="grid-column:span 2"><span class="tag">Capacidad estratégica</span><p data-edit="" contenteditable="false" data-key="t55">Reestructuración: desescaló la operación textil (paró la línea de denim) y apalancó el negocio inmobiliario, cuyos ingresos crecieron 20% en 2024, para proteger la sostenibilidad financiera. Lección: los activos fijos ociosos destruyen valor.</p></div>
+      </div></div>
+      <div class="panel" data-p="en"><div class="grid g3">
+        <div class="card"><span class="tag">Recursos</span><p data-edit="" contenteditable="false" data-key="t56">Plantas de reciclaje de PET "botella a botella"; red de recolección Eko Red; generación de energía con excedentes vendibles; certificaciones ambientales.</p></div>
+        <div class="card"><span class="tag b">Capacidades</span><p data-edit="" contenteditable="false" data-key="t57">Transformación de residuos en fibras y resinas; vigilancia tecnológica; diversificación de mercados (58% Colombia, 22% Norteamérica, el resto Brasil, Europa, Perú).</p></div>
+        <div class="card"><span class="tag g">Competencias distintivas</span><p data-edit="" contenteditable="false" data-key="t58">Liderazgo nacional en reciclaje de PET y en economía circular; nichos de alta especificación frente a commodities asiáticos.</p></div>
+        <div class="card"><span class="tag r">Competencia nuclear</span><p data-edit="" contenteditable="false" data-key="t59">Tecnología de reciclaje y química de polímeros, que sostiene el 65% de sus ingresos (negocios verdes).</p></div>
+        <div class="card" style="grid-column:span 2"><span class="tag">Capacidad estratégica</span><p data-edit="" contenteditable="false" data-key="t60">Eficiencia: redujo costos y gastos fijos 15,6% en 2025 pese a la inflación y al alza del salario mínimo; desapalancamiento y recompra de acciones.</p></div>
+      </div></div>
+    </div>
+  </div>
+</section>
+
+<!-- 11 COMPETENCIAS CRÍTICAS SÍNTESIS -->
+<section class="slide" data-title="Competencias críticas para Corbatul">
+  <div class="wrap">
+    <div class="kicker">07 · Síntesis</div>
+    <h2>Competencias críticas para el éxito en la industria</h2>
+    <p class="lead">Toca cada tarjeta para ver qué implica para Corbatul.</p>
+    <div class="grid g3" id="flipGrid"><div class="flip"><div class="flip-in"><div class="face"><span class="tag">Competencia 1</span><h3>Control del canal y de la marca</h3><p data-edit="" data-key="cf0" contenteditable="false">Arturo Calle, el único rentable de los tres, vende directo al consumidor y tiene una marca de alta reputación.</p><span class="hint">Toca para ver la implicación ↻</span></div><div class="face back"><h3>Para Corbatul</h3><p data-edit="" data-key="cb0" contenteditable="false">Corbatul debe fortalecer su marca y acercarse al cliente final (tienda propia, e-commerce, ventas corporativas) para capturar margen y reducir el poder de las grandes superficies.</p><span class="hint">↻ volver</span></div></div></div><div class="flip"><div class="flip-in"><div class="face"><span class="tag">Competencia 2</span><h3>Especialización en producto de valor agregado</h3><p data-edit="" data-key="cf1" contenteditable="false">Fabricato y Enka se refugian en nichos técnicos y de alta especificación que el contrabando y el commodity asiático no atacan fácilmente.</p><span class="hint">Toca para ver la implicación ↻</span></div><div class="face back"><h3>Para Corbatul</h3><p data-edit="" data-key="cb1" contenteditable="false">Enfocarse en moda masculina formal y complementos con diseño y calidad de acabado, donde el precio no es el único criterio de compra.</p><span class="hint">↻ volver</span></div></div></div><div class="flip"><div class="flip-in"><div class="face"><span class="tag">Competencia 3</span><h3>Eficiencia en costos y capital de trabajo</h3><p data-edit="" data-key="cf2" contenteditable="false">Enka redujo 15,6% sus costos y gastos fijos; Fabricato desescaló capacidad ociosa.</p><span class="hint">Toca para ver la implicación ↻</span></div><div class="face back"><h3>Para Corbatul</h3><p data-edit="" data-key="cb2" contenteditable="false">Estructura de costos flexible, control de inventarios por temporada y productividad laboral para absorber el salario mínimo más alto.</p><span class="hint">↻ volver</span></div></div></div><div class="flip"><div class="flip-in"><div class="face"><span class="tag">Competencia 4</span><h3>Innovación sostenible</h3><p data-edit="" data-key="cf3" contenteditable="false">El 65% de los ingresos de Enka viene de negocios verdes; Crystal invierte en energía solar.</p><span class="hint">Toca para ver la implicación ↻</span></div><div class="face back"><h3>Para Corbatul</h3><p data-edit="" data-key="cb3" contenteditable="false">Incorporar telas recicladas o certificadas y trazabilidad como argumento de venta y de acceso a mercados externos.</p><span class="hint">↻ volver</span></div></div></div><div class="flip"><div class="flip-in"><div class="face"><span class="tag">Competencia 5</span><h3>Agilidad y abastecimiento inteligente</h3><p data-edit="" data-key="cf4" contenteditable="false">El nearshoring abre espacio a proveedores cercanos que responden más rápido que Asia.</p><span class="hint">Toca para ver la implicación ↻</span></div><div class="face back"><h3>Para Corbatul</h3><p data-edit="" data-key="cb4" contenteditable="false">Competir en tiempo de respuesta (lotes cortos, reposición rápida) y explorar exportación a EE. UU. y Centroamérica.</p><span class="hint">↻ volver</span></div></div></div><div class="flip"><div class="flip-in"><div class="face"><span class="tag">Competencia 6</span><h3>Solidez financiera</h3><p data-edit="" data-key="cf5" contenteditable="false">Las líderes sostienen la operación con utilidades retenidas y bajan deuda en ciclos de tasas altas.</p><span class="hint">Toca para ver la implicación ↻</span></div><div class="face back"><h3>Para Corbatul</h3><p data-edit="" data-key="cb5" contenteditable="false">Mantener un endeudamiento prudente y liquidez suficiente para resistir caídas de demanda sin recurrir a crédito caro.</p><span class="hint">↻ volver</span></div></div></div></div>
+    <p class="src">Castellanos, Jiménez y Domínguez (2009) destacan que las competencias tecnológicas son la base para competir en Colombia: no basta con tener máquinas; se requiere la capacidad organizacional de aprender y combinar recursos.</p>
+  </div>
+</section>
+
+<!-- 12 FINANCIERO DATOS -->
+<section class="slide" data-title="Indicadores financieros clave">
+  <div class="wrap">
+    <div class="kicker">08 · Análisis financiero</div>
+    <h2>Lo que dicen las cifras públicas</h2>
+    <div class="grid g3">
+      <div class="card"><h3>Margen neto</h3><div id="marginBars"><div class="hbar"><span class="lbl">Arturo Calle</span><div class="track"><div class="fill " style="width:17.84360412293618%">3,6%</div></div></div><div class="hbar"><span class="lbl">Fabricato</span><div class="track"><div class="fill neg" style="width:80.03990827054233%">-16,0%</div></div></div></div><p class="src">Arturo Calle 2024: 22.782 / 638.380. Fabricato 2024: −43.000 / 268.616.</p></div>
+      <div class="card"><h3>Enka: desapalancamiento</h3>
+        <div class="hbar"><span class="lbl">Deuda neta 2024</span><div class="track"><div class="fill neg" style="width:100%">$50.965 M</div></div></div>
+        <div class="hbar"><span class="lbl">Deuda neta 2025</span><div class="track"><div class="fill" style="width:76%">$38.839 M</div></div></div>
+        <p data-edit="" contenteditable="false" data-key="t61">Redujo deuda neta 24% en un año, y bajó costos y gastos fijos 15,6%: en tasas altas, la prioridad fue proteger la caja.</p></div>
+      <div class="card"><h3>Fabricato: mezcla de negocios</h3>
+        <div class="hbar"><span class="lbl">Textil</span><div class="track"><div class="fill" style="width:94%">$252.600 M</div></div></div>
+        <div class="hbar"><span class="lbl">Inmobiliario</span><div class="track"><div class="fill" style="width:6%;background:var(--gold)"></div></div><small>$15.970 M</small></div>
+        <p data-edit="" contenteditable="false" data-key="t62">El inmobiliario es solo el 6% de los ingresos, pero aporta un EBITDA de $10.277 millones, señal de mejor rentabilidad por peso invertido.</p></div>
+    </div>
+    <div class="note" style="margin-top:14px" data-edit="" contenteditable="false" data-key="t63"><b>Hallazgo:</b> la empresa que controla el canal de venta (Arturo Calle) es la única rentable de las tres; las que están aguas arriba (fibra y tela) sufren por la competencia importada y por su alto peso de activos fijos. Para Corbatul, acercarse al cliente final mejora el margen.</div>
+  </div>
+</section>
+
+<!-- 13 VERTICAL BALANCE -->
+<section class="slide" data-title="Análisis vertical: Balance">
+  <div class="wrap">
+    <div class="kicker">08 · Análisis vertical del Estado de Situación Financiera</div>
+    <h2>¿En qué invierte y cómo se financia la industria?</h2>
+    <p>Modelo: <select class="select" id="bsModel"><option value="man">Manufactura textil (tipo Fabricato / Enka)</option><option value="ret">Confección con retail (tipo Arturo Calle)</option></select></p>
+    <div class="note r" style="margin-bottom:12px">Los valores precargados son una <b>estructura de referencia aproximada</b> para ilustrar el análisis. <b>Reemplázalos</b> con las cifras reales del Balance de la empresa (SIMEV / Supersociedades): escribe en las casillas y los porcentajes se recalculan solos.</div>
+    <div class="grid g2">
+      <div class="card tablewrap"><h3>Activo (inversión)</h3><table id="bsA"><tbody><tr><th>Rubro</th><th>Valor</th><th>%</th><th style="width:30%"></th></tr><tr><td>Efectivo y equivalentes</td><td><input type="number" step="any" value="4" data-k="bsman_A_0"></td><td class="num">4,0%</td><td><div class="bar " style="width:4%"></div></td></tr><tr><td>Cuentas por cobrar</td><td><input type="number" step="any" value="12" data-k="bsman_A_1"></td><td class="num">12,0%</td><td><div class="bar " style="width:12%"></div></td></tr><tr><td>Inventarios</td><td><input type="number" step="any" value="16" data-k="bsman_A_2"></td><td class="num">16,0%</td><td><div class="bar " style="width:16%"></div></td></tr><tr><td>Propiedad, planta y equipo</td><td><input type="number" step="any" value="50" data-k="bsman_A_3"></td><td class="num">50,0%</td><td><div class="bar " style="width:50%"></div></td></tr><tr><td>Propiedades de inversión</td><td><input type="number" step="any" value="12" data-k="bsman_A_4"></td><td class="num">12,0%</td><td><div class="bar " style="width:12%"></div></td></tr><tr><td>Otros activos</td><td><input type="number" step="any" value="6" data-k="bsman_A_5"></td><td class="num">6,0%</td><td><div class="bar " style="width:6%"></div></td></tr><tr class="tot"><td>Total</td><td class="num">100</td><td class="num">100%</td><td></td></tr></tbody></table></div>
+      <div class="card tablewrap"><h3>Pasivo + Patrimonio (financiación)</h3><table id="bsL"><tbody><tr><th>Rubro</th><th>Valor</th><th>%</th><th style="width:30%"></th></tr><tr><td>Obligaciones financieras</td><td><input type="number" step="any" value="18" data-k="bsman_L_0"></td><td class="num">18,0%</td><td><div class="bar l" style="width:18%"></div></td></tr><tr><td>Proveedores y cuentas por pagar</td><td><input type="number" step="any" value="9" data-k="bsman_L_1"></td><td class="num">9,0%</td><td><div class="bar l" style="width:9%"></div></td></tr><tr><td>Otros pasivos (laborales, impuestos)</td><td><input type="number" step="any" value="8" data-k="bsman_L_2"></td><td class="num">8,0%</td><td><div class="bar l" style="width:8%"></div></td></tr><tr><td>Patrimonio</td><td><input type="number" step="any" value="65" data-k="bsman_L_3"></td><td class="num">65,0%</td><td><div class="bar e" style="width:65%"></div></td></tr><tr class="tot"><td>Total</td><td class="num">100</td><td class="num">100%</td><td></td></tr></tbody></table></div>
+    </div>
+    <div class="card" style="margin-top:14px"><h3>Lectura</h3><p id="bsRead" data-edit="" contenteditable="false" data-key="bsRead_man">En la manufactura textil la inversión se concentra en activos fijos (planta y equipo ≈ la mitad del activo) y en inventarios. Es un negocio intensivo en capital con baja rotación del activo. Se financia principalmente con patrimonio; la deuda financiera es la principal fuente externa y su costo pesa sobre una utilidad operativa estrecha. Fabricato muestra además propiedades de inversión (negocio inmobiliario) que diversifican ingresos.</p></div>
+  </div>
+</section>
+
+<!-- 14 VERTICAL RESULTADOS -->
+<section class="slide" data-title="Análisis vertical: Resultados">
+  <div class="wrap">
+    <div class="kicker">08 · Análisis vertical del Estado de Resultados</div>
+    <h2>¿Cuáles son los costos más representativos?</h2>
+    <p>Modelo: <select class="select" id="isModel"><option value="man">Manufactura textil (tipo Fabricato / Enka)</option><option value="ret">Confección con retail (tipo Arturo Calle)</option></select></p>
+    <div class="note r" style="margin-bottom:12px">Base 100 = ingresos operacionales. Valores de referencia editables: sustitúyelos por los del Estado de Resultados real. En el caso de Arturo Calle, el margen neto (3,6%) coincide con la cifra pública de 2024.</div>
+    <div class="grid g2">
+      <div class="card tablewrap"><table id="isT"><tbody><tr><th>Rubro</th><th>% de ingresos</th><th style="width:35%"></th></tr><tr><td>Ingresos operacionales</td><td><input type="number" step="any" value="100" data-k="isman_R_0"></td><td><div class="bar " style="width:100%"></div></td></tr><tr><td>Costo de ventas</td><td><input type="number" step="any" value="-87" data-k="isman_R_1"></td><td><div class="bar c" style="width:87%"></div></td></tr><tr class="tot"><td>Utilidad bruta</td><td class="num">13,0%</td><td><div class="bar e" style="width:13%"></div></td></tr><tr><td>Gastos de administración</td><td><input type="number" step="any" value="-6" data-k="isman_R_3"></td><td><div class="bar c" style="width:6%"></div></td></tr><tr><td>Gastos de ventas</td><td><input type="number" step="any" value="-4" data-k="isman_R_4"></td><td><div class="bar c" style="width:4%"></div></td></tr><tr class="tot"><td>Utilidad operativa</td><td class="num">3,0%</td><td><div class="bar e" style="width:3%"></div></td></tr><tr><td>Gastos financieros netos</td><td><input type="number" step="any" value="-4" data-k="isman_R_6"></td><td><div class="bar c" style="width:4%"></div></td></tr><tr><td>Otros ingresos (no operacionales)</td><td><input type="number" step="any" value="2" data-k="isman_R_7"></td><td><div class="bar " style="width:2%"></div></td></tr><tr><td>Impuesto de renta</td><td><input type="number" step="any" value="0" data-k="isman_R_8"></td><td><div class="bar c" style="width:0%"></div></td></tr><tr class="tot"><td>Utilidad (pérdida) neta</td><td class="num">1,0%</td><td><div class="bar e" style="width:1%"></div></td></tr></tbody></table></div>
+      <div class="card"><h3>Lectura</h3><p id="isRead" data-edit="" contenteditable="false" data-key="isRead_man">El costo de ventas absorbe cerca del 85–88% de los ingresos (materias primas, mano de obra y costos indirectos de fabricación, incluida la depreciación de la planta). El margen bruto es estrecho, de modo que pequeños aumentos en salarios, energía o dólar llevan a pérdida operativa. Los gastos financieros terminan de borrar la utilidad: es el patrón de Fabricato (pérdida neta ≈ −16% de los ingresos en 2024) y explica la caída de más de 69% en la utilidad de Enka en 2025.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 15 RELACIÓN HALLAZGOS -->
+<section class="slide" data-title="Inversión, financiación y costos">
+  <div class="wrap">
+    <div class="kicker">08 · Relación de hallazgos</div>
+    <h2>Inversión ↔ financiación ↔ costos</h2>
+    <div class="grid g3">
+      <div class="card"><span class="tag b">Inversiones esenciales</span><ul class="clean" data-edit="" contenteditable="false" data-key="t66"><li><b>Propiedad, planta y equipo:</b> la mayor masa del activo en la manufactura; si está subutilizada, destruye rentabilidad (Fabricato).</li><li><b>Inventarios:</b> el activo corriente crítico en confección por temporadas y tallas; inventario sin rotar es caja atrapada.</li><li><b>Cartera:</b> relevante al vender a grandes superficies con plazos largos.</li></ul></div>
+      <div class="card"><span class="tag r">Fuentes de financiación</span><ul class="clean" data-edit="" contenteditable="false" data-key="t67"><li><b>Patrimonio y utilidades retenidas:</b> la fuente dominante en las líderes; dan resiliencia en crisis (Arturo Calle).</li><li><b>Proveedores:</b> financiación espontánea sin costo explícito.</li><li><b>Deuda financiera:</b> moderada y en reducción (Enka), porque con tasa BanRep de 12,25% el costo de la deuda supera fácilmente la rentabilidad del activo.</li></ul></div>
+      <div class="card"><span class="tag">Costos más representativos</span><ul class="clean" data-edit="" contenteditable="false" data-key="t68"><li><b>Costo de ventas:</b> 75–88% de los ingresos en la manufactura (materia prima + mano de obra + CIF).</li><li><b>Gastos de ventas:</b> el gran rubro del modelo retail (arriendos, personal de tienda).</li><li><b>Gastos financieros:</b> pequeños en porcentaje pero decisivos sobre una utilidad operativa delgada.</li></ul></div>
+    </div>
+    <div class="note" style="margin-top:14px" data-edit="" contenteditable="false" data-key="t69"><b>Relación clave:</b> como la industria es intensiva en activos y trabaja con márgenes estrechos, financiar activos de baja rotación con deuda cara amplifica las pérdidas. Las líderes financian con recursos propios, reducen activos improductivos y vigilan el capital de trabajo.</div>
+  </div>
+</section>
+
+<!-- 16 CONCLUSIONES -->
+<section class="slide" data-title="Conclusiones">
+  <div class="wrap">
+    <div class="kicker">09 · Conclusiones</div>
+    <h2>Conclusiones por objetivo</h2>
+    <div class="grid g2">
+      <div class="card"><span class="tag b">OE1 · Macroentorno</span><p data-edit="" contenteditable="false" data-key="t70">El entorno 2026 es desfavorable en lo económico y social (inflación de 6,29%, tasa de 12,25%, salario mínimo +23% y jornada de 42 horas), lo que eleva costos y frena la demanda; lo político es incierto por el cambio de gobierno, y lo ambiental y tecnológico abren oportunidades de diferenciación y nearshoring.</p></div>
+      <div class="card"><span class="tag b">OE2 · Fuerzas competitivas</span><p data-edit="" contenteditable="false" data-key="t71">La rivalidad, el poder de los clientes y la amenaza de entrantes externos son altos, por lo que la rentabilidad promedio del sector es baja. Corbatul debe evitar competir por precio y ocupar un nicho de valor agregado en moda masculina.</p></div>
+      <div class="card"><span class="tag b">OE3 · Competencias críticas</span><p data-edit="" contenteditable="false" data-key="t72">Las líderes comparten cuatro competencias: control del canal y de la marca, especialización en productos difíciles de imitar, eficiencia en costos y manejo de capital de trabajo, e innovación sostenible. Son las capacidades que Corbatul debe desarrollar.</p></div>
+      <div class="card"><span class="tag b">OE4 · Estructura financiera</span><p data-edit="" contenteditable="false" data-key="t73">La industria concentra su inversión en planta e inventarios, se financia principalmente con patrimonio y proveedores, y su costo dominante es el costo de ventas. Solo la empresa cercana al consumidor (Arturo Calle, margen neto ≈ 3,6%) es rentable; las de aguas arriba registran pérdidas o caídas fuertes de utilidad.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 17 IMPLICACIONES -->
+<section class="slide" data-title="Implicaciones para la gestión financiera">
+  <div class="wrap">
+    <div class="kicker">10 · Implicaciones para la gestión financiera</div>
+    <h2>Decidir para maximizar el valor de Corbatul</h2>
+    <div class="card navy" style="margin-bottom:14px"><p style="margin:0" data-edit="" contenteditable="false" data-key="t74"><b>Objetivo básico financiero:</b> maximizar el valor de la empresa para sus propietarios. Toda decisión se evalúa por si la rentabilidad del activo (ROA / RAN) supera el costo de capital (WACC); solo así se genera valor económico agregado (EVA &gt; 0).</p></div>
+    <div class="grid g2">
+      <details open=""><summary>1. Decisiones de inversión</summary><p data-edit="" contenteditable="false" data-key="t75">Invertir solo en activos que eleven la rotación o el margen: corte automatizado, diseño, canal digital. Evitar ampliar capacidad instalada mientras la demanda esté débil. Efecto: más ventas por peso invertido (mayor rotación de activos) y mayor ROA.</p></details>
+      <details open=""><summary>2. Decisiones de financiación</summary><p data-edit="" contenteditable="false" data-key="t76">Con tasa de política de 12,25%, el costo de la deuda puede superar el ROA del sector; usar deuda solo para proyectos con retorno claro y preferir recursos propios y crédito de proveedores. Efecto: menor gasto financiero y menor riesgo, que reduce el WACC.</p></details>
+      <details open=""><summary>3. Capital de trabajo</summary><p data-edit="" contenteditable="false" data-key="t77">Gestionar la productividad del capital de trabajo (PKT = KTNO / ventas): rotar inventarios por temporada, acortar la cartera con grandes superficies y negociar plazos con proveedores. Efecto: libera caja (flujo de caja libre) y disminuye la necesidad de endeudarse.</p></details>
+      <details open=""><summary>4. Costos y margen</summary><p data-edit="" contenteditable="false" data-key="t78">Compensar el alza del salario mínimo (+23%) con productividad por hora, aprovechar el arancel cero de insumos y diferenciar para sostener precio. Efecto: proteger el margen EBITDA, que es la fuente de la caja para invertir y pagar deuda.</p></details>
+      <details open=""><summary>5. Política de dividendos</summary><p data-edit="" contenteditable="false" data-key="t79">Retener utilidades mientras dure el ciclo de tasas altas, como hicieron las líderes. Efecto: patrimonio más sólido y capacidad de resistir crisis sin deuda cara.</p></details>
+      <details open=""><summary>6. Riesgo cambiario</summary><p data-edit="" contenteditable="false" data-key="t80">Como parte de los insumos se importa, cubrir la exposición al dólar (coberturas o compras programadas). Efecto: menor volatilidad del costo de ventas y del flujo de caja.</p></details>
+    </div>
+    <div class="note" style="margin-top:14px" data-edit="" contenteditable="false" data-key="t81"><b>En el simulador:</b> priorizar decisiones que mejoren el margen EBITDA y la rotación del capital de trabajo, mantener un endeudamiento prudente y medir cada periodo si la rentabilidad del activo supera el costo de capital.</div>
+  </div>
+</section>
+
+<!-- 18 REFERENCIAS -->
+<section class="slide" data-title="Referencias">
+  <div class="wrap refs">
+    <div class="kicker">Referencias</div>
+    <h2>Referencias</h2>
+    <div class="card" data-edit="" contenteditable="false" data-key="t82">
+      <p>Castellanos, O., Jiménez, C. y Domínguez, K. (2009). Competencias tecnológicas: bases conceptuales para el desarrollo tecnológico en Colombia. <i>Revista Ingeniería e Investigación, 29</i>(1), 133-139.</p>
+      <p>Hamel, G. y Prahalad, C. K. (1990). The core competence of the corporation. <i>Harvard Business Review, 68</i>(3), 79-91.</p>
+      <p>Núñez, L. (2016). <i>Finanzas 1. Contabilidad, planeación y administración financiera</i>. Instituto Mexicano de Contadores Públicos.</p>
+      <p>Pacheco, C. (2016). <i>La información financiera y administrativa. Enlace estratégico para la toma de decisiones</i>. Instituto Mexicano de Contadores Públicos.</p>
+      <p>Porter, M. E. (1979). How competitive forces shape strategy. <i>Harvard Business Review, 57</i>(2), 137-145.</p>
+      <p>BBVA Research. (2026, 1 de octubre). <i>Colombia: BanRep incrementó la tasa de política monetaria en septiembre</i>. https://www.bbvaresearch.com</p>
+      <p>Valora Analitik. (2026, octubre). <i>Inflación en Colombia volvió a acelerarse a septiembre</i>. https://www.valoraanalitik.com</p>
+      <p>Valora Analitik. (2026). <i>Utilidades de Enka cayeron más de 69% entre 2024 y 2025</i>. https://www.valoraanalitik.com/utilidades-de-enka-cayeron-mas-de-69-entre-2024-y-2025/</p>
+      <p>La República. (2025, 27 de febrero). <i>Los ingresos de Fabricato llegaron a $268.600 millones, 21% menos frente a 2023</i>. https://www.larepublica.co/empresas/cifras-de-fabricato-de-2024-4074218</p>
+      <p>Forbes Colombia. (2026, 13 de febrero). <i>Arturo Calle</i>. https://forbes.co/2026/02/13/editors-picks/arturo-calle</p>
+      <p>Perfil. (2026). <i>Salario mínimo en Colombia 2026: cuánto sube y cómo impacta a las empresas</i>. https://www.perfil.com</p>
+      <p>Presidencia de la República de Colombia. (2025). <i>Decretos 1197 y 1198 de 2025</i> (aranceles a insumos y materias primas de confecciones y calzado).</p>
+      <p>Ministerio de Comercio, Industria y Turismo. (2025). <i>Proyecto de decreto: aranceles para insumos y materias primas del sector confecciones</i>. https://www.mincit.gov.co</p>
+      <p>El Colombiano. (2026, 21 de enero). <i>Colombiatex 2026: el gran tema son las guerras geopolíticas y arancelarias</i>. https://www.elcolombiano.com</p>
+      <p>Fenalco. (2025). <i>Corrupción, aranceles desproporcionados y exceso de reglamentación, el mayor caldo de cultivo para el contrabando</i>.</p>
+      <p>Abceconomía. (2026, 14 de julio). <i>Colombiamoda 2026 se extiende a siete días en Medellín</i>. https://abceconomia.co</p>
+      <p>RCN Radio. (2026). <i>Abelardo de la Espriella confirma dónde y cómo será su posesión como presidente de Colombia</i>. https://newsroom.rcnradio.com</p>
+    </div>
+    <p class="src">Estados financieros completos: SIMEV – Superintendencia Financiera (Fabricato, Enka) y portal de información empresarial de la Superintendencia de Sociedades (Arturo Calle, Crystal).</p>
+  </div>
+</section>
+
+</main>
+
+<nav class="navbar">
+  <button class="navbtn" id="prev" aria-label="Anterior">←</button>
+  <span class="counter" id="counter">1 / 18</span>
+  <button class="navbtn" id="next" aria-label="Siguiente">→</button>
+</nav>
+<div class="edit-hint">Modo edición activo: haz clic en cualquier texto con borde punteado. Se guarda automáticamente en este navegador.</div>
+
+<script>
+(function(){
+const STORE='corbatul_act4_v1';
+const store={get(){try{return JSON.parse(localStorage.getItem(STORE)||'{}')}catch(e){return {}}},set(o){try{localStorage.setItem(STORE,JSON.stringify(o))}catch(e){}}};
+
+/* ---------- Data ---------- */
+const forces=[
+ {n:'Amenaza de nuevos entrantes',lv:4,
+  d:'Las barreras de entrada a la confección son bajas: se necesita poca inversión para montar un taller, la tecnología es accesible y no hay economías de escala decisivas. La verdadera amenaza son los entrantes externos: importadores de prendas asiáticas, plataformas de moda rápida en línea y contrabando, que llegan sin invertir en planta local. Los aranceles a confecciones de países sin acuerdo comercial elevan la barrera, pero el contrabando la debilita.',
+  i:'Corbatul no puede apoyarse en barreras estructurales; debe construir barreras propias: marca, relación con clientes institucionales y rapidez de reposición.'},
+ {n:'Poder de negociación de los proveedores',lv:3,
+  d:'Poder medio. La tela y los insumos tienen proveedores nacionales (Fabricato, Enka, Coltejer) e internacionales, lo que da alternativas. Sin embargo, gran parte de los insumos es importada (el 40% de las empresas importa más de la mitad), con exposición al dólar, y los textiles técnicos o certificados tienen pocos oferentes. El arancel cero a insumos de confección (2025) reduce el poder de los proveedores locales.',
+  i:'Diversificar proveedores, negociar plazos de pago (financiación sin costo) y gestionar el riesgo cambiario de las compras importadas.'},
+ {n:'Rivalidad entre competidores actuales',lv:5,
+  d:'Muy alta. Hay más de 60.000 empresas en la cadena, con gran informalidad, producto poco diferenciado en el segmento básico y una demanda interna débil por tasas e inflación altas. Compiten marcas nacionales fuertes (Arturo Calle, Crystal/Gef, Studio F), cadenas internacionales (Zara, H&M, Koaj) e importación asiática a precios muy bajos. Las líderes de aguas arriba reportan caídas: Fabricato −21% en ingresos 2024 y Enka −14% en 2025.',
+  i:'Guerra de precios = destrucción de margen. Corbatul debe diferenciarse por nicho (moda masculina formal y complementos de calidad) y controlar costos fijos.'},
+ {n:'Poder de negociación de los clientes',lv:4,
+  d:'Alto. Las grandes superficies concentran la distribución (el Grupo Éxito comercializa cerca de $1,4 billones de los $7 billones que produce la confección), imponen precios, plazos de pago largos y devoluciones. El consumidor final es sensible al precio y tiene alternativas abundantes, con costo de cambio prácticamente nulo.',
+  i:'Reducir la dependencia de pocos clientes grandes, desarrollar canal propio o digital y vigilar la rotación de cartera (capital de trabajo).'},
+ {n:'Amenaza de productos sustitutos',lv:3,
+  d:'Media. El vestuario no tiene sustituto funcional, pero sí sustitutos de compra: ropa de segunda mano, alquiler de prendas, moda rápida en línea y cambio de hábitos (menos uso de corbata y ropa formal por el trabajo remoto y el estilo casual). Para la línea de corbatas, la tendencia hacia la informalidad es una amenaza real.',
+  i:'Ampliar el portafolio hacia prendas business-casual y accesorios, y medir la rentabilidad por línea de producto para retirar las que pierden demanda.'}
+];
+const lvTxt=['','Bajo','Medio-bajo','Medio','Alto','Muy alto'];
+const lvCol=['','#2f7d5b','#5b9b6e','#d08a1c','#c25b2e','#8c2f39'];
+
+const comps=[
+ {t:'Control del canal y de la marca',f:'Arturo Calle, el único rentable de los tres, vende directo al consumidor y tiene una marca de alta reputación.',b:'Corbatul debe fortalecer su marca y acercarse al cliente final (tienda propia, e-commerce, ventas corporativas) para capturar margen y reducir el poder de las grandes superficies.'},
+ {t:'Especialización en producto de valor agregado',f:'Fabricato y Enka se refugian en nichos técnicos y de alta especificación que el contrabando y el commodity asiático no atacan fácilmente.',b:'Enfocarse en moda masculina formal y complementos con diseño y calidad de acabado, donde el precio no es el único criterio de compra.'},
+ {t:'Eficiencia en costos y capital de trabajo',f:'Enka redujo 15,6% sus costos y gastos fijos; Fabricato desescaló capacidad ociosa.',b:'Estructura de costos flexible, control de inventarios por temporada y productividad laboral para absorber el salario mínimo más alto.'},
+ {t:'Innovación sostenible',f:'El 65% de los ingresos de Enka viene de negocios verdes; Crystal invierte en energía solar.',b:'Incorporar telas recicladas o certificadas y trazabilidad como argumento de venta y de acceso a mercados externos.'},
+ {t:'Agilidad y abastecimiento inteligente',f:'El nearshoring abre espacio a proveedores cercanos que responden más rápido que Asia.',b:'Competir en tiempo de respuesta (lotes cortos, reposición rápida) y explorar exportación a EE. UU. y Centroamérica.'},
+ {t:'Solidez financiera',f:'Las líderes sostienen la operación con utilidades retenidas y bajan deuda en ciclos de tasas altas.',b:'Mantener un endeudamiento prudente y liquidez suficiente para resistir caídas de demanda sin recurrir a crédito caro.'}
+];
+
+const BS={
+ man:{A:[['Efectivo y equivalentes',4],['Cuentas por cobrar',12],['Inventarios',16],['Propiedad, planta y equipo',50],['Propiedades de inversión',12],['Otros activos',6]],
+      L:[['Obligaciones financieras',18,'l'],['Proveedores y cuentas por pagar',9,'l'],['Otros pasivos (laborales, impuestos)',8,'l'],['Patrimonio',65,'e']],
+      r:'En la manufactura textil la inversión se concentra en activos fijos (planta y equipo ≈ la mitad del activo) y en inventarios. Es un negocio intensivo en capital con baja rotación del activo. Se financia principalmente con patrimonio; la deuda financiera es la principal fuente externa y su costo pesa sobre una utilidad operativa estrecha. Fabricato muestra además propiedades de inversión (negocio inmobiliario) que diversifican ingresos.'},
+ ret:{A:[['Efectivo y equivalentes',8],['Cuentas por cobrar',5],['Inventarios',30],['Propiedad, planta y equipo',30],['Derechos de uso (arriendos NIIF 16)',17],['Otros activos',10]],
+      L:[['Obligaciones financieras',10,'l'],['Proveedores y cuentas por pagar',14,'l'],['Pasivo por arrendamientos',18,'l'],['Otros pasivos',8,'l'],['Patrimonio',50,'e']],
+      r:'En el modelo confección + retail, el inventario es la inversión más representativa del activo corriente (producto terminado en tiendas por tallas y temporadas) y los locales comerciales aparecen como derechos de uso. La financiación combina patrimonio, crédito de proveedores y pasivos por arrendamiento; la deuda bancaria es moderada. La clave es la rotación del inventario.'}
+};
+const IS={
+ man:{rows:[['Ingresos operacionales',100,'t'],['Costo de ventas',-87,'c'],['Utilidad bruta',null,'s'],['Gastos de administración',-6,'c'],['Gastos de ventas',-4,'c'],['Utilidad operativa',null,'s'],['Gastos financieros netos',-4,'c'],['Otros ingresos (no operacionales)',2,'t'],['Impuesto de renta',0,'c'],['Utilidad (pérdida) neta',null,'s']],
+      r:'El costo de ventas absorbe cerca del 85–88% de los ingresos (materias primas, mano de obra y costos indirectos de fabricación, incluida la depreciación de la planta). El margen bruto es estrecho, de modo que pequeños aumentos en salarios, energía o dólar llevan a pérdida operativa. Los gastos financieros terminan de borrar la utilidad: es el patrón de Fabricato (pérdida neta ≈ −16% de los ingresos en 2024) y explica la caída de más de 69% en la utilidad de Enka en 2025.'},
+ ret:{rows:[['Ingresos operacionales',100,'t'],['Costo de ventas',-50,'c'],['Utilidad bruta',null,'s'],['Gastos de administración',-7,'c'],['Gastos de ventas',-35,'c'],['Utilidad operativa',null,'s'],['Gastos financieros netos',-2,'c'],['Otros ingresos (no operacionales)',0.4,'t'],['Impuesto de renta',-1.8,'c'],['Utilidad (pérdida) neta',null,'s']],
+      r:'Al vender directamente, el margen bruto es alto (≈ 50%), pero los gastos de ventas (arriendos, personal de tienda, publicidad) son el segundo costo más representativo. La utilidad neta resulta baja pero positiva (≈ 3,6%, como Arturo Calle en 2024). La palanca está en la productividad de cada tienda y en no cargar gastos financieros altos.'}
+};
+
+/* ---------- Saved state ---------- */
+const BAKED=/*BAKED*/{"text":{"nombre":"ORLANDO JOSE OLEA GOMEZ","id":"<span style=\"color: rgb(0, 0, 0); font-family: &quot;Open Sans&quot;, sans-serif; font-size: 14.44px; font-weight: 400; background-color: rgba(246, 246, 241, 0.22);\">100221946</span>","programa":"<span style=\"color: rgb(0, 0, 0); font-family: &quot;Open Sans&quot;, sans-serif; font-size: 14.44px; font-weight: 400; background-color: rgba(246, 246, 241, 0.22);\">ESP GERENCIA DE PROYECTOS&nbsp;</span>","docente":"GERENCIA FINANCIERA · LESLIE CAROLINA VILLAMIL ESCOBAR"},"num":{}}/*END*/;
+let S=store.get();
+if(BAKED&&!Object.keys(S.text||{}).length&&!Object.keys(S.num||{}).length)S=BAKED;
+S.text=S.text||{}; S.num=S.num||{};
+
+/* ---------- Slides ---------- */
+const slides=[...document.querySelectorAll('.slide')];
+let cur=0;
+const menuList=document.getElementById('menuList');
+slides.forEach((s,i)=>{const li=document.createElement('li');li.textContent=s.dataset.title;li.onclick=()=>{go(i);toggleMenu(false)};menuList.appendChild(li)});
+function go(i){
+  if(i<0||i>=slides.length)return;
+  slides.forEach((s,k)=>{s.classList.toggle('active',k===i);s.classList.toggle('prev',k<i)});
+  cur=i;
+  document.getElementById('counter').textContent=(i+1)+' / '+slides.length;
+  document.getElementById('progress').style.width=((i+1)/slides.length*100)+'%';
+  [...menuList.children].forEach((li,k)=>li.classList.toggle('cur',k===i));
+  slides[i].scrollTop=0;
+  if(slides[i].querySelector('#revBars'))animateBars();
+  try{location.hash='s'+(i+1)}catch(e){}
+}
+document.getElementById('prev').onclick=()=>go(cur-1);
+document.getElementById('next').onclick=()=>go(cur+1);
+document.addEventListener('keydown',e=>{
+  if(document.body.classList.contains('editing')&&document.activeElement&&(document.activeElement.isContentEditable||document.activeElement.tagName==='INPUT'))return;
+  if(e.key==='ArrowRight'||e.key==='PageDown')go(cur+1);
+  if(e.key==='ArrowLeft'||e.key==='PageUp')go(cur-1);
+});
+let tx=null;
+document.getElementById('deck').addEventListener('touchstart',e=>{tx=e.touches[0].clientX},{passive:true});
+document.getElementById('deck').addEventListener('touchend',e=>{if(tx===null)return;const dx=e.changedTouches[0].clientX-tx;if(Math.abs(dx)>70&&!document.body.classList.contains('editing'))go(cur+(dx<0?1:-1));tx=null});
+const menu=document.getElementById('menu');
+function toggleMenu(v){menu.classList.toggle('open',v===undefined?!menu.classList.contains('open'):v)}
+document.getElementById('btnMenu').onclick=()=>toggleMenu();
+
+/* ---------- Tabs ---------- */
+document.querySelectorAll('[data-tabs]').forEach(tb=>{
+  const name=tb.dataset.tabs, panels=document.querySelector('[data-panels="'+name+'"]');
+  tb.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{
+    tb.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x===b));
+    panels.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on',p.dataset.p===b.dataset.t));
+  });
+});
+
+/* ---------- Porter ---------- */
+const fEls=[...document.querySelectorAll('.force')];
+fEls.forEach(el=>{const f=forces[+el.dataset.f];el.querySelector('i').style.width=(f.lv*20)+'%';el.querySelector('i').style.background=lvCol[f.lv];el.querySelector('.lv').textContent='Poder: '+lvTxt[f.lv]+' ('+f.lv+'/5)';
+  el.onclick=()=>{fEls.forEach(x=>x.classList.toggle('on',x===el));showForce(+el.dataset.f)}});
+function showForce(k){const f=forces[k];document.getElementById('forceDetail').innerHTML=
+ '<span class="tag" style="background:'+lvCol[f.lv]+';color:#fff">Poder '+lvTxt[f.lv]+'</span><h3>'+f.n+'</h3><p data-edit data-key="force_d'+k+'">'+f.d+'</p><div class="note"><b>Implicación para Corbatul:</b> <span data-edit data-key="force_i'+k+'">'+f.i+'</span></div>';
+ applyText(document.getElementById('forceDetail'));refreshEditable();}
+showForce(2);
+const order=[1,0,2,4,3];
+document.getElementById('porterTable').innerHTML=order.map(k=>{const f=forces[k];return '<tr><td><b>'+f.n+'</b></td><td data-edit data-key="pt_d'+k+'">'+f.d+'</td><td><span class="tag" style="background:'+lvCol[f.lv]+';color:#fff">'+lvTxt[f.lv]+'</span><div class="meter"><i style="width:'+f.lv*20+'%;background:'+lvCol[f.lv]+'"></i></div></td><td data-edit data-key="pt_i'+k+'">'+f.i+'</td></tr>'}).join('');
+
+/* ---------- Revenue bars ---------- */
+const rev=[['Arturo Calle (2024)',638380],['Enka (2025)',406475],['Fabricato (2024)',268616]];
+const maxR=638380;
+document.getElementById('revBars').innerHTML=rev.map(r=>'<div class="hbar"><span class="lbl">'+r[0]+'</span><div class="track"><div class="fill" data-w="'+(r[1]/maxR*100)+'" style="width:0">$'+r[1].toLocaleString('es-CO')+'</div></div></div>').join('');
+const mg=[['Arturo Calle',22782/638380*100],['Fabricato',-43000/268616*100]];
+document.getElementById('marginBars').innerHTML=mg.map(m=>'<div class="hbar"><span class="lbl">'+m[0]+'</span><div class="track"><div class="fill '+(m[1]<0?'neg':'')+'" style="width:'+Math.min(100,Math.abs(m[1])*5)+'%">'+m[1].toFixed(1).replace('.',',')+'%</div></div></div>').join('');
+function animateBars(){setTimeout(()=>document.querySelectorAll('#revBars .fill').forEach(f=>f.style.width=f.dataset.w+'%'),150)}
+
+/* ---------- Flip cards ---------- */
+document.getElementById('flipGrid').innerHTML=comps.map((c,k)=>'<div class="flip"><div class="flip-in"><div class="face"><span class="tag">Competencia '+(k+1)+'</span><h3>'+c.t+'</h3><p data-edit data-key="cf'+k+'">'+c.f+'</p><span class="hint">Toca para ver la implicación ↻</span></div><div class="face back"><h3>Para Corbatul</h3><p data-edit data-key="cb'+k+'">'+c.b+'</p><span class="hint">↻ volver</span></div></div></div>').join('');
+document.querySelectorAll('.flip').forEach(f=>f.addEventListener('click',()=>{if(!document.body.classList.contains('editing'))f.classList.toggle('on')}));
+
+/* ---------- Vertical analysis ---------- */
+const fmt=n=>(Math.round(n*10)/10).toLocaleString('es-CO',{minimumFractionDigits:1,maximumFractionDigits:1});
+function numKey(m,sec,i){return m+'_'+sec+'_'+i}
+function renderBS(){
+  const m=document.getElementById('bsModel').value, d=BS[m];
+  ['A','L'].forEach(sec=>{
+    const rows=d[sec].map((r,i)=>{const k=numKey('bs'+m,sec,i);return {n:r[0],v:(S.num[k]!==undefined?S.num[k]:r[1]),c:r[2]||'',k}});
+    const tot=rows.reduce((a,r)=>a+(+r.v||0),0)||1;
+    document.getElementById('bs'+sec).innerHTML='<tr><th>Rubro</th><th>Valor</th><th>%</th><th style="width:30%"></th></tr>'+
+      rows.map(r=>{const p=(+r.v||0)/tot*100;return '<tr><td>'+r.n+'</td><td><input type="number" step="any" value="'+r.v+'" data-k="'+r.k+'"></td><td class="num">'+fmt(p)+'%</td><td><div class="bar '+r.c+'" style="width:'+Math.max(0,p)+'%"></div></td></tr>'}).join('')+
+      '<tr class="tot"><td>Total</td><td class="num">'+tot.toLocaleString('es-CO')+'</td><td class="num">100%</td><td></td></tr>';
+  });
+  const rk='bsRead_'+m; const el=document.getElementById('bsRead'); el.dataset.key=rk; el.innerHTML=S.text[rk]!==undefined?S.text[rk]:d.r;
+  bindInputs('bs',renderBS);
+}
+function renderIS(){
+  const m=document.getElementById('isModel').value, d=IS[m];
+  let acc=0, out='<tr><th>Rubro</th><th>% de ingresos</th><th style="width:35%"></th></tr>';
+  let ing=100;
+  d.rows.forEach((r,i)=>{
+    const k=numKey('is'+m,'R',i);
+    if(r[1]===null){out+='<tr class="tot"><td>'+r[0]+'</td><td class="num">'+fmt(acc/ing*100)+'%</td><td><div class="bar '+(acc<0?'l':'e')+'" style="width:'+Math.min(100,Math.abs(acc/ing*100))+'%"></div></td></tr>';return}
+    const v=S.num[k]!==undefined?S.num[k]:r[1];
+    if(i===0){ing=(+v)||100;acc=ing}else acc+=(+v||0);
+    const p=(+v||0)/ing*100;
+    out+='<tr><td>'+r[0]+'</td><td><input type="number" step="any" value="'+v+'" data-k="'+k+'"></td><td><div class="bar '+(r[2]==='c'?'c':'')+'" style="width:'+Math.min(100,Math.abs(p))+'%"></div></td></tr>';
+  });
+  document.getElementById('isT').innerHTML=out;
+  const rk='isRead_'+m; const el=document.getElementById('isRead'); el.dataset.key=rk; el.innerHTML=S.text[rk]!==undefined?S.text[rk]:d.r;
+  bindInputs('is',renderIS);
+}
+function bindInputs(pref,fn){
+  document.querySelectorAll('input[data-k^="'+pref+'"]').forEach(inp=>inp.onchange=()=>{S.num[inp.dataset.k]=inp.value===''?0:+inp.value;store.set(S);fn()});
+}
+document.getElementById('bsModel').onchange=renderBS;
+document.getElementById('isModel').onchange=renderIS;
+
+/* ---------- Editable text ---------- */
+let autoId=0;
+document.querySelectorAll('[data-edit]').forEach(el=>{if(!el.dataset.key)el.dataset.key='t'+(autoId++)});
+function applyText(root){(root||document).querySelectorAll('[data-edit]').forEach(el=>{const k=el.dataset.key;if(k&&S.text[k]!==undefined)el.innerHTML=S.text[k]})}
+function refreshEditable(){const on=document.body.classList.contains('editing');document.querySelectorAll('[data-edit]').forEach(el=>{el.contentEditable=on?'true':'false';el.oninput=()=>{S.text[el.dataset.key]=el.innerHTML;store.set(S)}})}
+applyText();renderBS();renderIS();refreshEditable();
+
+const btnEdit=document.getElementById('btnEdit');
+btnEdit.onclick=()=>{document.body.classList.toggle('editing');btnEdit.classList.toggle('on');refreshEditable()};
+document.getElementById('btnReset').onclick=()=>{if(confirm('¿Borrar todos tus cambios y volver a los textos originales?')){S={text:{},num:{}};store.set(S);location.reload()}};
+document.getElementById('btnPrint').onclick=()=>{toggleMenu(false);window.print()};
+
+/* Download an HTML copy with edits baked in */
+document.getElementById('btnSave').onclick=()=>{
+  const wasEditing=document.body.classList.contains('editing');
+  if(wasEditing){document.body.classList.remove('editing');refreshEditable()}
+  const clone=document.documentElement.cloneNode(true);
+  // bake numbers into BS/IS defaults
+  clone.querySelectorAll('.slide').forEach((s,k)=>{s.classList.toggle('active',k===0);s.classList.remove('prev')});
+  clone.querySelector('#menu').classList.remove('open');
+  const json=JSON.stringify(S).split('*/').join('*\\/');
+  const html='<!DOCTYPE html>\n'+clone.outerHTML.replace(/\/\*BAKED\*\/[\s\S]*?\/\*END\*\//,'/*BAKED*/'+json+'/*END*/');
+  const blob=new Blob([html],{type:'text/html'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  const nm=(S.text.nombre||'').replace(/<[^>]+>/g,'').replace(/[^\wÁÉÍÓÚáéíóúñÑ ]/g,'').trim().replace(/\s+/g,'_');
+  a.download='Actividad4_Corbatul'+(nm&&!nm.startsWith('Escribe')?'_'+nm:'')+'.html';
+  document.body.appendChild(a);a.click();a.remove();
+  if(wasEditing){document.body.classList.add('editing');refreshEditable()}
+};
+
+/* start */
+const h=parseInt((location.hash||'').replace('#s',''),10);
+go(isNaN(h)?0:Math.min(slides.length-1,Math.max(0,h-1)));
+})();
+</script>
+
+
+</body></html>
